@@ -1,4 +1,4 @@
 curl_cffi>=0.5.10
 requests>=2.31.0
 discord.py>=2.3.0
-mailtm>=0.1.4
+mailtm>=0.0.8
