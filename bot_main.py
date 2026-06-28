@@ -13,6 +13,7 @@ from queue import Queue
 from threading import Lock
 from dataclasses import dataclass
 from typing import Any
+import requests as req
 
 # Local modules
 from modules.http import HttpClient
@@ -20,6 +21,7 @@ from modules.roblox import RobloxAuth, RobloxError
 from modules.solvex_client import SolvexClient, SolverError
 from modules.email_client import TempEmail
 from modules.logger import C, c
+from proxy_fetcher import fetch_webshare_proxies   # <-- new
 
 # ─── config ──────────────────────────────────────────────────────────
 DISCORD_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
@@ -29,6 +31,15 @@ if not DISCORD_TOKEN:
 SOLVEX_KEY = os.environ.get("SOLVEX_API_KEY") or os.environ.get("NOPECHA_API_KEY")
 if not SOLVEX_KEY:
     raise RuntimeError("Captcha API key not set (SOLVEX_API_KEY or NOPECHA_API_KEY)")
+
+DISCORD_CHANNEL_ID = int(os.environ.get("DISCORD_CHANNEL_ID", 0))  # set this!
+if not DISCORD_CHANNEL_ID:
+    print("⚠️ DISCORD_CHANNEL_ID not set – embeds will not be sent.")
+
+# Proxy mode: "webshare" | "pool" | "none"
+PROXY_MODE = os.environ.get("PROXY_MODE", "none").lower()
+WEBSHARE_API_KEY = os.environ.get("WEBSHARE_API_KEY")
+WEBSHARE_PROXY_LIMIT = int(os.environ.get("WEBSHARE_PROXY_LIMIT", 10))
 
 # ─── helpers ──────────────────────────────────────────────────────────
 def gen_password() -> str:
@@ -52,12 +63,58 @@ def gen_birthday() -> str:
 def gen_gender() -> int:
     return random.choices([1, 2, 3], weights=[45, 45, 10])[0]
 
-# ─── shared state ──────────────────────────────────────────────────
-job_queue = Queue()
-active_jobs = {}  # user_id -> count
-job_lock = Lock()
+def gen_username() -> str:
+    adj = ["Swift","Brave","Clever","Epic","Fuzzy","Glitch","Hyper","Jolly",
+           "Keen","Lucky","Mystic","Neon","Orbit","Pixel","Quirky","Rapid",
+           "Savage","Turbo","Ultra","Vivid","Wild","Zen"]
+    noun = ["Arrow","Blaze","Comet","Dash","Echo","Falcon","Glide","Hawk",
+            "Ion","Jet","King","Lynx","Max","Nova","Owl","Pulse","Quest",
+            "Raven","Spark","Titan","Viper","Wolf"]
+    suffix = "".join(random.choices("0123456789abcdef", k=4))
+    return f"{random.choice(adj)}{random.choice(noun)}{suffix}"[:20]
 
-# ─── account creation logic (runs in thread) ─────────────────────
+# ─── proxy pool ──────────────────────────────────────────────────
+proxy_pool = []
+proxy_lock = Lock()
+proxy_index = 0
+
+def init_proxies():
+    global proxy_pool
+    if PROXY_MODE == "webshare":
+        if WEBSHARE_API_KEY:
+            proxy_pool = fetch_webshare_proxies(WEBSHARE_API_KEY, WEBSHARE_PROXY_LIMIT)
+            if not proxy_pool:
+                print("⚠️ No proxies from Webshare – falling back to none.")
+                return False
+            print(f"✅ Loaded {len(proxy_pool)} proxies from Webshare.")
+            return True
+        else:
+            print("⚠️ WEBSHARE_API_KEY not set – falling back to none.")
+            return False
+    elif PROXY_MODE == "pool":
+        proxy_file = os.environ.get("PROXY_FILE", "input/proxies.txt")
+        try:
+            with open(proxy_file, "r") as f:
+                proxy_pool = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+            print(f"✅ Loaded {len(proxy_pool)} proxies from {proxy_file}.")
+            return True
+        except:
+            print(f"⚠️ Could not read {proxy_file} – falling back to none.")
+            return False
+    else:
+        print("ℹ️ Proxy mode set to none – direct connection.")
+        return True
+
+def get_next_proxy() -> str | None:
+    if not proxy_pool:
+        return None
+    with proxy_lock:
+        global proxy_index
+        proxy = proxy_pool[proxy_index % len(proxy_pool)]
+        proxy_index += 1
+        return proxy
+
+# ─── account creation logic ─────────────────────────────────────
 def create_account_sync(
     solver: SolvexClient,
     username: str | None,
@@ -70,18 +127,12 @@ def create_account_sync(
         username: str
         password: str
         email: str | None
+        user_id: int | None
+        cookie: str | None
         error: str | None
     """
     if not username:
-        # generate random if none provided
-        adj = ["Swift","Brave","Clever","Epic","Fuzzy","Glitch","Hyper","Jolly",
-               "Keen","Lucky","Mystic","Neon","Orbit","Pixel","Quirky","Rapid",
-               "Savage","Turbo","Ultra","Vivid","Wild","Zen"]
-        noun = ["Arrow","Blaze","Comet","Dash","Echo","Falcon","Glide","Hawk",
-                "Ion","Jet","King","Lynx","Max","Nova","Owl","Pulse","Quest",
-                "Raven","Spark","Titan","Viper","Wolf"]
-        suffix = "".join(random.choices("0123456789abcdef", k=4))
-        username = f"{random.choice(adj)}{random.choice(noun)}{suffix}"[:20]
+        username = gen_username()
 
     password = gen_password()
     birthday = gen_birthday()
@@ -89,12 +140,11 @@ def create_account_sync(
     email_addr = None
     temp_email = None
 
-    # If we need email, create a temp mailbox
     if verify_email:
         temp_email = TempEmail()
         email_addr = temp_email.create()
 
-    # browser profile – we'll use a default one (chrome)
+    # browser profile – chrome
     profile = {
         "impersonate": "chrome146",
         "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
@@ -116,22 +166,21 @@ def create_account_sync(
 
     try:
         auth.warmup_signup_page()
-        # attempt signup with email if available
         challenge, resp_data = auth.signup_with_email(username, password, birthday, gender, email_addr or "")
     except RobloxError as e:
         client.close()
-        return {"success": False, "error": f"RobloxError: {e}", "username": username, "password": password, "email": email_addr}
+        return {"success": False, "error": f"RobloxError: {e}", "username": username, "password": password, "email": email_addr, "user_id": None, "cookie": None}
 
-    # If no challenge, account created
+    # No challenge → account created
     if challenge is None:
         jar = client._session.cookies
-        cookies = "; ".join(f"{k}={v}" for k, v in jar.items())
+        cookie_str = "; ".join(f"{k}={v}" for k, v in jar.items())
+        user_id = resp_data.get("userId") if resp_data else None
         client.close()
-        return {"success": True, "username": username, "password": password, "email": email_addr, "cookies": cookies, "error": None}
+        return {"success": True, "username": username, "password": password, "email": email_addr, "user_id": user_id, "cookie": cookie_str, "error": None}
 
-    # We have a captcha challenge – solve it
+    # Solve captcha
     try:
-        # Hardcoded Arkose keys
         ARKOSE_PK = "A2A14B1D-1AF3-C791-9BBC-EE33CC7A0A6F"
         ARKOSE_SURL = "https://arkoselabs.roblox.com"
         ROBLOX_SITE = "https://www.roblox.com"
@@ -145,18 +194,16 @@ def create_account_sync(
             proxy=proxy,
             location_href="https://www.roblox.com/CreateAccount",
             referrer="https://www.roblox.com/CreateAccount",
-            solve_pow=False,  # NopeCHA handles it
+            solve_pow=False,
             user_agent=profile["user_agent"],
         )
         if arkose_resp.get("status") != "done":
             client.close()
-            return {"success": False, "error": f"Captcha failed: {arkose_resp.get('error')}", "username": username, "password": password, "email": email_addr}
+            return {"success": False, "error": f"Captcha failed: {arkose_resp.get('error')}", "username": username, "password": password, "email": email_addr, "user_id": None, "cookie": None}
 
         token = arkose_resp["token"]
-        # Submit token
         auth.submit_arkose_token(token)
 
-        # final signup with token
         meta_b64 = base64.b64encode(json.dumps({
             "unifiedCaptchaId": challenge.unified_captcha_id,
             "captchaToken": token,
@@ -185,29 +232,26 @@ def create_account_sync(
         )
         if final_resp.status_code != 200:
             client.close()
-            return {"success": False, "error": f"Final signup failed: {final_resp.text[:200]}", "username": username, "password": password, "email": email_addr}
+            return {"success": False, "error": f"Final signup failed: {final_resp.text[:200]}", "username": username, "password": password, "email": email_addr, "user_id": None, "cookie": None}
 
-        # Account created
         jar = client._session.cookies
-        cookies = "; ".join(f"{k}={v}" for k, v in jar.items())
+        cookie_str = "; ".join(f"{k}={v}" for k, v in jar.items())
+        user_id = final_resp.json().get("userId") if final_resp.json() else None
         client.close()
 
-        # Optional email verification
         if verify_email and temp_email and email_addr:
             link = temp_email.wait_for_verification_link(timeout_s=60)
             if link:
-                # Send GET to verify
-                import requests
                 try:
-                    requests.get(link, timeout=10)
-                except Exception:
-                    pass  # ignore, verification may still work
+                    req.get(link, timeout=10)
+                except:
+                    pass
 
-        return {"success": True, "username": username, "password": password, "email": email_addr, "cookies": cookies, "error": None}
+        return {"success": True, "username": username, "password": password, "email": email_addr, "user_id": user_id, "cookie": cookie_str, "error": None}
 
     except Exception as e:
         client.close()
-        return {"success": False, "error": f"Exception: {e}", "username": username, "password": password, "email": email_addr}
+        return {"success": False, "error": f"Exception: {e}", "username": username, "password": password, "email": email_addr, "user_id": None, "cookie": None}
 
 # ─── Discord bot ──────────────────────────────────────────────────
 
@@ -226,14 +270,12 @@ class AccountBot(discord.Client):
         while True:
             if not job_queue.empty():
                 job = job_queue.get()
-                # job is dict: user_id, username, verify_email, proxy
                 await self.execute_job(job)
             await asyncio.sleep(0.5)
 
     async def execute_job(self, job):
         user_id = job["user_id"]
         try:
-            # Run blocking account creation in executor
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
                 None,
@@ -241,42 +283,83 @@ class AccountBot(discord.Client):
                 self.solver,
                 job.get("username"),
                 job.get("verify_email", False),
-                job.get("proxy"),
+                get_next_proxy(),
             )
-            # Send DM
+            # Send DM to user
             user = await self.fetch_user(user_id)
             if result["success"]:
                 msg = f"✅ Account created!\nUsername: `{result['username']}`\nPassword: `{result['password']}`"
                 if result.get("email"):
                     msg += f"\nEmail: `{result['email']}`"
                 await user.send(msg)
+
+                # Send embed to configured channel
+                await self.send_account_embed(result)
             else:
                 await user.send(f"❌ Failed: {result['error']}\nUsername: `{result['username']}`")
         except Exception as e:
-            # fallback
             try:
                 user = await self.fetch_user(user_id)
                 await user.send(f"⚠️ Something went wrong: {e}")
             except:
                 pass
 
-    async def on_ready(self):
-        print(f"Logged in as {self.user}")
+    async def send_account_embed(self, account_info: dict):
+        """Send a rich embed to DISCORD_CHANNEL_ID with account details."""
+        if not DISCORD_CHANNEL_ID:
+            return
+        channel = self.get_channel(DISCORD_CHANNEL_ID)
+        if not channel:
+            try:
+                channel = await self.fetch_channel(DISCORD_CHANNEL_ID)
+            except:
+                print(f"❌ Could not find channel {DISCORD_CHANNEL_ID}")
+                return
 
-bot = AccountBot()
+        embed = discord.Embed(
+            title="🎮 New Roblox Account",
+            color=discord.Color.green(),
+            timestamp=discord.utils.utcnow()
+        )
+        embed.add_field(name="Username", value=f"`{account_info['username']}`", inline=True)
+        embed.add_field(name="Password", value=f"`{account_info['password']}`", inline=True)
+        if account_info.get("email"):
+            embed.add_field(name="Email", value=f"`{account_info['email']}`", inline=True)
+        embed.add_field(name="Cookie (`.ROBLOSECURITY`)", value=f"```\n{account_info.get('cookie', 'N/A')}\n```", inline=False)
+
+        # Fetch profile picture from Roblox API
+        if account_info.get("user_id"):
+            avatar_url = f"https://www.roblox.com/headshot-thumbnail/image?userId={account_info['user_id']}&width=420&height=420&format=png"
+            embed.set_thumbnail(url=avatar_url)
+            embed.add_field(name="User ID", value=f"`{account_info['user_id']}`", inline=True)
+
+        embed.set_footer(text="Generated by Account Creator Bot")
+
+        try:
+            await channel.send(embed=embed)
+        except Exception as e:
+            print(f"Failed to send embed: {e}")
+
+    async def on_ready(self):
+        print(f"✅ Logged in as {self.user}")
+        # Initialize proxies
+        init_proxies()
+
+# ─── job queue ──────────────────────────────────────────────────
+job_queue = Queue()
 
 # ─── Slash commands ──────────────────────────────────────────────
+
+bot = AccountBot()
 
 @bot.tree.command(name="create", description="Create an account with a custom username (email verification optional)")
 @app_commands.describe(username="Desired Roblox username", verify_email="Verify email after creation?")
 async def create_cmd(interaction: discord.Interaction, username: str, verify_email: bool = False):
     await interaction.response.defer(ephemeral=True)
-    # Add job to queue
     job = {
         "user_id": interaction.user.id,
         "username": username,
         "verify_email": verify_email,
-        "proxy": None,  # you could add proxy selection later
     }
     job_queue.put(job)
     await interaction.followup.send(f"Queued account `{username}` (email verification: {verify_email}). You'll get a DM when done.")
@@ -293,7 +376,6 @@ async def create_bulk_cmd(interaction: discord.Interaction, count: int):
             "user_id": interaction.user.id,
             "username": None,  # random
             "verify_email": False,
-            "proxy": None,
         }
         job_queue.put(job)
     await interaction.followup.send(f"Queued {count} random accounts. You'll get DMs when each is done.")
@@ -305,4 +387,4 @@ async def status_cmd(interaction: discord.Interaction):
 
 # ─── run ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
+    bot.run(DISCORD_TOKEN)y
